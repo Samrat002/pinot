@@ -261,6 +261,9 @@ public class ZKOperator {
   }
 
   private void checkCRC(HttpHeaders headers, String tableNameWithType, String segmentName, long existingCrc) {
+    if (headers == null) {
+      return;
+    }
     String expectedCrcStr = headers.getHeaderString(HttpHeaders.IF_MATCH);
     if (expectedCrcStr != null) {
       long expectedCrc;
@@ -344,10 +347,27 @@ public class ZKOperator {
       // Release lock. Expected version will be 0 as we hold a lock and no updates could take place meanwhile.
       newSegmentZKMetadata.setSegmentUploadStartTime(-1);
       if (!_pinotHelixResourceManager.updateZkMetadata(tableNameWithType, newSegmentZKMetadata, 0)) {
-        _pinotHelixResourceManager.deleteSegment(tableNameWithType, segmentName);
-        LOGGER.info("Deleted zk entry and segment {} for table {}.", segmentName, tableNameWithType);
-        throw new RuntimeException(
-            String.format("Failed to update ZK metadata for segment: %s of table: %s", segmentFile, tableNameWithType));
+        // There is a race condition when it took too much time for the 1st segment upload to process (due to slow
+        // PinotFS access), which leads to the 2nd attempt of segment upload, and the 2nd segment upload succeeded.
+        // In this case, when the 1st upload comes back, it shouldn't blindly delete the segment when it failed to
+        // update the zk metadata. Instead, the 1st attempt should validate the crc one more time. If crc remains the
+        // same, segment deletion should be skipped.
+        ZNRecord existingSegmentMetadataZNRecord =
+            _pinotHelixResourceManager.getSegmentMetadataZnRecord(tableNameWithType, segmentName);
+        // Check if CRC match when IF-MATCH header is set
+        SegmentZKMetadata segmentZKMetadata = new SegmentZKMetadata(existingSegmentMetadataZNRecord);
+        long existingCrc = segmentZKMetadata.getCrc();
+        try {
+          checkCRC(headers, tableNameWithType, segmentName, existingCrc);
+          LOGGER.info("CRC is the same as the one in ZK. Skip updating the zk metadata for segment: " + segmentName);
+        } catch (ControllerApplicationException e) {
+          LOGGER.error("Failed to validate CRC for segment: " + segmentName, e);
+          _pinotHelixResourceManager.deleteSegment(tableNameWithType, segmentName);
+          LOGGER.info("Deleted zk entry and segment {} for table {}.", segmentName, tableNameWithType);
+          throw new RuntimeException(
+              String.format("Failed to update ZK metadata for segment: %s of table: %s", segmentFile,
+                  tableNameWithType));
+        }
       }
     }
   }
